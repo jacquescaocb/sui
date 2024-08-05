@@ -180,7 +180,9 @@ pub trait ExecutionCacheCommit: Send + Sync {
         digests: &'a [TransactionDigest],
     ) -> BoxFuture<'a, SuiResult>;
 
-    /// Durably commit a transaction (but not its outputs) to the database.
+    /// Durably commit a transaction and its effects to the database.
+    /// Note that this merely stores the transaction and effects payloads so they can be retrieved
+    /// after a restart. It does not record the effects digest as
     fn persist_transaction(&self, transaction: &VerifiedExecutableTransaction) -> SuiResult;
 }
 
