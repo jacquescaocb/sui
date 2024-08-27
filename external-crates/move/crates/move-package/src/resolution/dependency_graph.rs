@@ -376,6 +376,74 @@ impl<Progress: Write> DependencyGraphBuilder<Progress> {
         let mut dep_orig_names = BTreeMap::new();
         let mut overrides = BTreeMap::new();
         for (dep_pkg_name, dep) in dependencies {
+            if dep_pkg_name == "_".into() {
+                // "_" is a reserved "dependency" name to trigger external
+                // resolution for multiple grouped packages at a time.
+                match dep {
+                    PM::Dependency::External(resolver) => {
+                        let output = Command::new(resolver.as_str())
+                            .arg("--resolve-move-dependencies")
+                            .arg(dep_pkg_name.as_str())
+                            .current_dir(root_path.clone())
+                            .output()
+                            .with_context(|| format!("Running resolver: {resolver}"))?;
+
+                        let progress_output = &mut self.progress_output;
+                        if !output.stderr.is_empty() {
+                            let stderr_label = format!("{resolver} stderr:").red();
+                            writeln!(progress_output, "{stderr_label}")?;
+                            progress_output.write_all(&output.stderr)?;
+                        }
+
+                        if !output.status.success() {
+                            let err_msg = format!("'{resolver}' failed to resolve packages");
+                            if let Some(code) = output.status.code() {
+                                bail!("{err_msg}. Exited with code: {code}");
+                            } else {
+                                bail!("{err_msg}. Terminated by signal");
+                            }
+                        }
+
+                        let sub_graph = DependencyGraph::read_from_lock(
+                            root_path.clone(),
+                            parent_pkg_id,
+                            parent_pkg_name,
+                            &mut output.stdout.as_slice(),
+                            Some(resolver),
+                        )
+                            .with_context(|| {
+                                format!(
+                                    "Parsing response from '{resolver}' for dependency group '_' of package '{parent_pkg_id}'"
+                                )
+                            })?;
+
+                        let (
+                            pkg_graph,
+                            is_override,
+                            is_external,
+                            resolved_pkg_id,
+                            resolved_version,
+                        ) = (sub_graph, false, true, dep_pkg_name, None::<Symbol>);
+
+                        dep_graphs.insert(
+                            resolved_pkg_id,
+                            DependencyGraphInfo::new(
+                                pkg_graph,
+                                mode,
+                                is_override,
+                                is_external,
+                                resolved_version,
+                            ),
+                        );
+                        resolved_id_deps.insert(resolved_pkg_id, dep.clone());
+                        dep_orig_names.insert(resolved_pkg_id, dep_pkg_name);
+
+                        continue;
+                    }
+                    _ => bail!("Resolver dependency \"_\" must specify a resolver"),
+                }
+            };
+
             let (pkg_graph, is_override, is_external, resolved_pkg_id, resolved_version) = self
                 .new_for_dep(
                     parent,
@@ -962,12 +1030,33 @@ impl DependencyGraph {
                 // the way that external graphs are constructed, edges between the (root) package of
                 // the outer graph and dependencies in the sub-graph are already present in the
                 // sub-graph
-                let d = sub_graph
-                    .package_graph
-                    .edge_weight(self.root_package_id, dep_pkg_id)
-                    .unwrap();
-                self.package_graph
-                    .add_edge(self.root_package_id, dep_pkg_id, d.clone());
+                if dep_pkg_id != "_".into() {
+                    // add edges for external dependencies that are not grouped by the reserved resolver "_".
+                    let d = sub_graph
+                        .package_graph
+                        .edge_weight(self.root_package_id, dep_pkg_id)
+                        .unwrap();
+                    self.package_graph
+                        .add_edge(self.root_package_id, dep_pkg_id, d.clone());
+                    return Ok(false);
+                }
+                // add all external packages that are grouped by the reserved resolver "_".
+                // this is done by finding all direct package IDs of the root package and inserting
+                // those that have an external resolver in the package table.
+                for (_, pkg_id, _) in sub_graph.package_graph.edges(self.root_package_id) {
+                    if sub_graph
+                        .package_table
+                        .get(&pkg_id)
+                        .is_some_and(|p| p.resolver.is_some())
+                    {
+                        let d = sub_graph
+                            .package_graph
+                            .edge_weight(self.root_package_id, pkg_id)
+                            .unwrap();
+                        self.package_graph
+                            .add_edge(self.root_package_id, pkg_id, d.clone());
+                    };
+                }
                 Ok(false)
             }
         }
