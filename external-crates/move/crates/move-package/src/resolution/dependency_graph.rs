@@ -198,6 +198,8 @@ pub struct DependencyGraphBuilder<Progress: Write> {
     install_dir: PathBuf,
 }
 
+const EXTERNAL_RESOLVER_DEPENDENCY_GROUP: &str = "_";
+
 impl<Progress: Write> DependencyGraphBuilder<Progress> {
     pub fn new(
         skip_fetch_latest_git_deps: bool,
@@ -376,7 +378,7 @@ impl<Progress: Write> DependencyGraphBuilder<Progress> {
         let mut dep_orig_names = BTreeMap::new();
         let mut overrides = BTreeMap::new();
         for (dep_pkg_name, dep) in dependencies {
-            if dep_pkg_name == "_".into() {
+            if dep_pkg_name == EXTERNAL_RESOLVER_DEPENDENCY_GROUP.into() {
                 // "_" is a reserved "dependency" name to trigger external
                 // resolution for multiple grouped packages at a time.
                 match dep {
@@ -413,7 +415,8 @@ impl<Progress: Write> DependencyGraphBuilder<Progress> {
                         )
                             .with_context(|| {
                                 format!(
-                                    "Parsing response from '{resolver}' for dependency group '_' of package '{parent_pkg_id}'"
+                                    "Parsing response from '{resolver}' for dependency group \
+                                     '{EXTERNAL_RESOLVER_DEPENDENCY_GROUP}' of package '{parent_pkg_id}'"
                                 )
                             })?;
 
@@ -939,6 +942,8 @@ impl DependencyGraph {
                 }
             }
         }
+        //        eprintln!("graph: {:#?}", self.package_graph);
+        //        eprintln!("table: {:#?}", self.package_table);
 
         Ok(())
     }
@@ -1030,7 +1035,7 @@ impl DependencyGraph {
                 // the way that external graphs are constructed, edges between the (root) package of
                 // the outer graph and dependencies in the sub-graph are already present in the
                 // sub-graph
-                if dep_pkg_id != "_".into() {
+                if dep_pkg_id != EXTERNAL_RESOLVER_DEPENDENCY_GROUP.into() {
                     // add edges for external dependencies that are not grouped by the reserved resolver "_".
                     let d = sub_graph
                         .package_graph
