@@ -60,10 +60,7 @@ impl<S: MoveResolver> TransactionDataCache<S> {
             }
             if !modules.is_empty() {
                 change_set
-                    .add_account_changeset(
-                        addr,
-                        AccountChangeSet::from_modules(modules),
-                    )
+                    .add_account_changeset(addr, AccountChangeSet::from_modules(modules))
                     .expect("accounts should be unique");
             }
         }
@@ -117,6 +114,26 @@ impl<S: MoveResolver> DataStore for TransactionDataCache<S> {
             Ok(Some(bytes)) => Ok(bytes),
             Ok(None) => Err(PartialVMError::new(StatusCode::LINKER_ERROR)
                 .with_message(format!("Cannot find {:?} in data cache", module_id))
+                .finish(Location::Undefined)),
+            Err(err) => {
+                let msg = format!("Unexpected storage error: {:?}", err);
+                Err(
+                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                        .with_message(msg)
+                        .finish(Location::Undefined),
+                )
+            }
+        }
+    }
+
+    fn load_package(&self, package_id: &AccountAddress) -> VMResult<Vec<Vec<u8>>> {
+        if let Some(address_cache) = self.module_map.get(&package_id) {
+            return Ok(address_cache.module_map.values().cloned().collect());
+        }
+        match self.remote.get_package(package_id) {
+            Ok(Some(bytes)) => Ok(bytes),
+            Ok(None) => Err(PartialVMError::new(StatusCode::LINKER_ERROR)
+                .with_message(format!("Cannot find {:?} in data cache", package_id))
                 .finish(Location::Undefined)),
             Err(err) => {
                 let msg = format!("Unexpected storage error: {:?}", err);

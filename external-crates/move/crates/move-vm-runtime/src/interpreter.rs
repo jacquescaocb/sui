@@ -915,8 +915,14 @@ impl Frame {
                         .enable_invariant_violation_check_in_swap_loc,
                 )?;
             }
-            Bytecode::Call(fun) => {
+            Bytecode::KnownCall(fun) => {
                 return Ok(InstrRet::ExitCode(ExitCode::Call(*fun)));
+            }
+            Bytecode::VirtualCall(vtable_key) => {
+                unimplemented!(
+                    "Virtual call with vtable key not implemented yet {:?}",
+                    vtable_key
+                );
             }
             Bytecode::CallGeneric(idx) => {
                 return Ok(InstrRet::ExitCode(ExitCode::CallGeneric(*idx)));
