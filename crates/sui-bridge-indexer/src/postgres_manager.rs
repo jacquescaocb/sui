@@ -7,6 +7,7 @@ use crate::schema::sui_progress_store::txn_digest;
 use crate::schema::{sui_error_transactions, token_transfer_data};
 use crate::{schema, schema::token_transfer, ProcessedTxnData};
 use diesel::result::Error;
+use diesel::upsert::excluded;
 use diesel::BoolExpressionMethods;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::Pool;
@@ -59,12 +60,30 @@ pub async fn write(pool: &PgPool, token_txns: Vec<ProcessedTxnData>) -> Result<(
             async move {
                 diesel::insert_into(token_transfer_data::table)
                     .values(&data)
-                    .on_conflict_do_nothing()
+                    .on_conflict((
+                        schema::token_transfer_data::dsl::chain_id,
+                        schema::token_transfer_data::dsl::nonce,
+                    ))
+                    .do_update()
+                    .set((
+                        token_transfer_data::txn_hash.eq(excluded(token_transfer_data::txn_hash)),
+                        token_transfer_data::block_height
+                            .eq(excluded(token_transfer_data::block_height)),
+                    ))
                     .execute(conn)
                     .await?;
                 diesel::insert_into(token_transfer::table)
                     .values(&transfers)
-                    .on_conflict_do_nothing()
+                    .on_conflict((
+                        schema::token_transfer::dsl::chain_id,
+                        schema::token_transfer::dsl::nonce,
+                        schema::token_transfer::dsl::status,
+                    ))
+                    .do_update()
+                    .set((
+                        token_transfer::txn_hash.eq(excluded(token_transfer::txn_hash)),
+                        token_transfer::block_height.eq(excluded(token_transfer::block_height)),
+                    ))
                     .execute(conn)
                     .await?;
                 diesel::insert_into(sui_error_transactions::table)

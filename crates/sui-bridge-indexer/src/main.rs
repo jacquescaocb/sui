@@ -1,8 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -10,8 +12,11 @@ use clap::*;
 use ethers::providers::Http;
 use ethers::providers::Middleware;
 use ethers::providers::Provider;
+use ethers::types::Address as EthAddress;
+use sui_bridge::eth_client::EthClient;
+use sui_bridge::metered_eth_provider::MeteredEthHttpProvier;
+use sui_bridge_indexer::eth_bridge_indexer::EthFinalizedSyncDatasource;
 use sui_bridge_indexer::eth_bridge_indexer::EthSubscriptionDatasource;
-use sui_bridge_indexer::eth_bridge_indexer::EthSyncDatasource;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -105,22 +110,37 @@ async fn main() -> Result<()> {
     let subscription_indexer_fut = spawn_logged_monitored_task!(eth_subscription_indexer.start());
 
     // Start the eth sync indexer
-    let eth_sync_datasource = EthSyncDatasource::new(
+    let client: Arc<EthClient<MeteredEthHttpProvier>> = Arc::new(
+        EthClient::<MeteredEthHttpProvier>::new(
+            &config.eth_rpc_url,
+            HashSet::from_iter(vec![EthAddress::from_str(
+                &config.eth_sui_bridge_contract_address,
+            )?]),
+            bridge_metrics.clone(),
+        )
+        .await?,
+    );
+
+    let finalized_block = client
+        .get_last_finalized_block_id()
+        .await
+        .expect("Unable to get finalized_block");
+
+    let eth_sync_datasource = EthFinalizedSyncDatasource::new(
         config.eth_sui_bridge_contract_address.clone(),
         config.eth_rpc_url.clone(),
         indexer_meterics.clone(),
         bridge_metrics.clone(),
     )?;
     let eth_sync_indexer = IndexerBuilder::new(
-        "EthBridgeSyncIndexer",
+        "EthBridgeFinalizedSyncIndexer",
         eth_sync_datasource,
         EthDataMapper {
             metrics: indexer_meterics.clone(),
         },
     )
     .with_backfill_strategy(BackfillStrategy::Partitioned { task_size: 1000 })
-    .disable_live_task()
-    .build(current_block, config.start_block, datastore.clone());
+    .build(finalized_block, config.start_block, datastore.clone());
     let sync_indexer_fut = spawn_logged_monitored_task!(eth_sync_indexer.start());
 
     if let Some(sui_rpc_url) = config.sui_rpc_url.clone() {

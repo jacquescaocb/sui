@@ -130,14 +130,14 @@ impl Datasource<RawEthData> for EthSubscriptionDatasource {
     }
 }
 
-pub struct EthSyncDatasource {
+pub struct EthFinalizedSyncDatasource {
     bridge_address: EthAddress,
     eth_http_url: String,
     indexer_metrics: BridgeIndexerMetrics,
     bridge_metrics: Arc<BridgeMetrics>,
 }
 
-impl EthSyncDatasource {
+impl EthFinalizedSyncDatasource {
     pub fn new(
         eth_sui_bridge_contract_address: String,
         eth_http_url: String,
@@ -154,7 +154,7 @@ impl EthSyncDatasource {
     }
 }
 #[async_trait]
-impl Datasource<RawEthData> for EthSyncDatasource {
+impl Datasource<RawEthData> for EthFinalizedSyncDatasource {
     async fn start_data_retrieval(
         &self,
         starting_checkpoint: u64,
@@ -182,6 +182,25 @@ impl Datasource<RawEthData> for EthSyncDatasource {
 
         let handle = spawn_monitored_task!(async move {
             let mut cached_blocks: HashMap<u64, Block<H256>> = HashMap::new();
+
+            let mut last_finalized_block = retry_with_max_elapsed_time!(
+                client.get_last_finalized_block_id(),
+                Duration::from_secs(30000)
+            )
+            .expect("Unable to get latest finalized block from provider")
+            .expect("Failed to unwrap the inner result");
+
+            // block process until current range is finalized
+            while target_checkpoint > last_finalized_block {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                last_finalized_block = retry_with_max_elapsed_time!(
+                    client.get_last_finalized_block_id(),
+                    Duration::from_secs(30000)
+                )
+                .expect("Unable to retry fetching the finalized block")
+                .expect("Unable to get latest finalized block from provider");
+            }
 
             let Ok(Ok(logs)) = retry_with_max_elapsed_time!(
                 client.get_raw_events_in_range(
