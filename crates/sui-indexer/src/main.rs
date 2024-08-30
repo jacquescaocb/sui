@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use sui_indexer::config::Command;
-use sui_indexer::db::{get_pool_connection, new_connection_pool, reset_database};
+use sui_indexer::db::{get_pool_connection, new_connection_pool, reset_database, run_migrations};
 use sui_indexer::indexer::Indexer;
 use sui_indexer::store::PgIndexerStore;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +38,9 @@ async fn main() -> Result<(), IndexerError> {
             snapshot_config,
             pruning_options,
         } => {
+            // Make sure to run all migrations on startup, and also serve as a compatibility check.
+            run_migrations(&mut get_pool_connection(&connection_pool)?)?;
+
             let store = PgIndexerStore::new(connection_pool, indexer_metrics.clone());
             Indexer::start_writer_with_config(
                 &ingestion_config,
@@ -50,6 +53,9 @@ async fn main() -> Result<(), IndexerError> {
             .await?;
         }
         Command::JsonRpcService(json_rpc_config) => {
+            // Make sure to run all migrations on startup, and also serve as a compatibility check.
+            run_migrations(&mut get_pool_connection(&connection_pool)?)?;
+
             Indexer::start_reader(&json_rpc_config, &registry, connection_pool).await?;
         }
         Command::ResetDatabase { force } => {

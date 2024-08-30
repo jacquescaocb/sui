@@ -1,14 +1,18 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::Duration;
-
 use crate::errors::IndexerError;
+use anyhow::anyhow;
 use clap::Args;
 use diesel::query_dsl::RunQueryDsl;
 use diesel::r2d2::ConnectionManager;
 use diesel::r2d2::{Pool, PooledConnection};
 use diesel::PgConnection;
+use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use std::time::Duration;
+use tracing::info;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/pg");
 
 pub type ConnectionPool = Pool<ConnectionManager<PgConnection>>;
 pub type PoolConnection = PooledConnection<ConnectionManager<PgConnection>>;
@@ -122,15 +126,17 @@ pub fn reset_database(conn: &mut PoolConnection) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-pub mod setup_postgres {
-    use crate::db::PoolConnection;
-    use anyhow::anyhow;
-    use diesel::migration::MigrationSource;
-    use diesel::RunQueryDsl;
-    use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
-    use tracing::info;
+pub fn run_migrations(conn: &mut PoolConnection) -> Result<(), anyhow::Error> {
+    conn.run_pending_migrations(MIGRATIONS)
+        .map_err(|e| anyhow!("Failed to run migrations {e}"))?;
+    info!("Ran migrations.");
+    Ok(())
+}
 
-    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/pg");
+pub mod setup_postgres {
+    use crate::db::{run_migrations, PoolConnection};
+    use diesel::RunQueryDsl;
+    use tracing::info;
 
     pub fn reset_database(conn: &mut PoolConnection) -> Result<(), anyhow::Error> {
         info!("Resetting PG database ...");
@@ -185,8 +191,7 @@ pub mod setup_postgres {
         .execute(conn)?;
         info!("Created __diesel_schema_migrations table.");
 
-        conn.run_migrations(&MIGRATIONS.migrations().unwrap())
-            .map_err(|e| anyhow!("Failed to run migrations {e}"))?;
+        run_migrations(conn)?;
         info!("Reset database complete.");
         Ok(())
     }
