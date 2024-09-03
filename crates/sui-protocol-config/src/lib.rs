@@ -2705,14 +2705,14 @@ impl ProtocolConfig {
                     cfg.consensus_max_num_transactions_in_block = Some(512);
 
                     cfg.feature_flags.rethrow_serialization_type_layout_errors = true;
-
+                }
+                56 => {
                     if chain != Chain::Mainnet && chain != Chain::Testnet {
                         // Enable distributed vote scoring
                         cfg.feature_flags
                             .consensus_distributed_vote_scoring_strategy = true;
                     }
-                }
-                56 => {
+
                     // Reduce minimum number of random beacon shares.
                     cfg.random_beacon_reduction_lower_bound = Some(800);
                 }
