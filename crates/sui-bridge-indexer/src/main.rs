@@ -14,9 +14,11 @@ use ethers::providers::Middleware;
 use ethers::providers::Provider;
 use ethers::types::Address as EthAddress;
 use sui_bridge::eth_client::EthClient;
+use sui_bridge::eth_syncer;
 use sui_bridge::metered_eth_provider::MeteredEthHttpProvier;
 use sui_bridge_indexer::eth_bridge_indexer::EthFinalizedSyncDatasource;
 use sui_bridge_indexer::eth_bridge_indexer::EthSubscriptionDatasource;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -94,7 +96,7 @@ async fn main() -> Result<()> {
     // Start the eth subscription indexer
 
     let eth_subscription_datasource = EthSubscriptionDatasource::new(
-        config.eth_sui_bridge_contract_address.clone(),
+        vec![config.eth_sui_bridge_contract_address.clone()],
         config.eth_ws_url.clone(),
         indexer_meterics.clone(),
     )?;
@@ -109,7 +111,7 @@ async fn main() -> Result<()> {
     .build(current_block, subscription_end_block, datastore.clone());
     let subscription_indexer_fut = spawn_logged_monitored_task!(eth_subscription_indexer.start());
 
-    // Start the eth sync indexer
+    // Start the finalized eth sync indexer
     let client: Arc<EthClient<MeteredEthHttpProvier>> = Arc::new(
         EthClient::<MeteredEthHttpProvier>::new(
             &config.eth_rpc_url,
@@ -121,17 +123,18 @@ async fn main() -> Result<()> {
         .await?,
     );
 
-    let finalized_block = client
+    let last_finalized_block = client
         .get_last_finalized_block_id()
         .await
         .expect("Unable to get finalized_block");
 
     let eth_sync_datasource = EthFinalizedSyncDatasource::new(
-        config.eth_sui_bridge_contract_address.clone(),
+        vec![config.eth_sui_bridge_contract_address.clone()],
         config.eth_rpc_url.clone(),
         indexer_meterics.clone(),
         bridge_metrics.clone(),
     )?;
+
     let eth_sync_indexer = IndexerBuilder::new(
         "EthBridgeFinalizedSyncIndexer",
         eth_sync_datasource,
@@ -140,7 +143,7 @@ async fn main() -> Result<()> {
         },
     )
     .with_backfill_strategy(BackfillStrategy::Partitioned { task_size: 1000 })
-    .build(finalized_block, config.start_block, datastore.clone());
+    .build(last_finalized_block, config.start_block, datastore.clone());
     let sync_indexer_fut = spawn_logged_monitored_task!(eth_sync_indexer.start());
 
     if let Some(sui_rpc_url) = config.sui_rpc_url.clone() {

@@ -13,8 +13,10 @@ use ethers::providers::{Http, Middleware, Provider, StreamExt, Ws};
 use ethers::types::{Address as EthAddress, Block, Filter, H256};
 use sui_bridge::error::BridgeError;
 use sui_bridge::eth_client::EthClient;
+use sui_bridge::eth_syncer::EthSyncer;
 use sui_bridge::metered_eth_provider::MeteredEthHttpProvier;
 use sui_bridge::retry_with_max_elapsed_time;
+use tokio::sync::watch::Receiver;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -33,20 +35,23 @@ use crate::{
 type RawEthData = (RawEthLog, Block<H256>, Transaction);
 
 pub struct EthSubscriptionDatasource {
-    bridge_address: EthAddress,
+    addresses: Vec<EthAddress>,
     eth_ws_url: String,
     indexer_metrics: BridgeIndexerMetrics,
 }
 
 impl EthSubscriptionDatasource {
     pub fn new(
-        eth_sui_bridge_contract_address: String,
+        eth_sui_bridge_contract_addresses: Vec<String>,
         eth_ws_url: String,
         indexer_metrics: BridgeIndexerMetrics,
     ) -> Result<Self, anyhow::Error> {
-        let bridge_address = EthAddress::from_str(&eth_sui_bridge_contract_address)?;
+        let bridge_addresses = eth_sui_bridge_contract_addresses
+            .iter()
+            .map(|address| EthAddress::from_str(address).unwrap())
+            .collect();
         Ok(Self {
-            bridge_address,
+            addresses: bridge_addresses,
             eth_ws_url,
             indexer_metrics,
         })
@@ -61,7 +66,7 @@ impl Datasource<RawEthData> for EthSubscriptionDatasource {
         data_sender: DataSender<RawEthData>,
     ) -> Result<JoinHandle<Result<(), Error>>, Error> {
         let filter = Filter::new()
-            .address(self.bridge_address)
+            .address(self.addresses.clone())
             .from_block(starting_checkpoint)
             .to_block(target_checkpoint);
 
@@ -131,7 +136,7 @@ impl Datasource<RawEthData> for EthSubscriptionDatasource {
 }
 
 pub struct EthFinalizedSyncDatasource {
-    bridge_address: EthAddress,
+    bridge_addresses: Vec<EthAddress>,
     eth_http_url: String,
     indexer_metrics: BridgeIndexerMetrics,
     bridge_metrics: Arc<BridgeMetrics>,
@@ -139,14 +144,17 @@ pub struct EthFinalizedSyncDatasource {
 
 impl EthFinalizedSyncDatasource {
     pub fn new(
-        eth_sui_bridge_contract_address: String,
+        eth_sui_bridge_contract_addresses: Vec<String>,
         eth_http_url: String,
         indexer_metrics: BridgeIndexerMetrics,
         bridge_metrics: Arc<BridgeMetrics>,
     ) -> Result<Self, anyhow::Error> {
-        let bridge_address = EthAddress::from_str(&eth_sui_bridge_contract_address)?;
+        let bridge_addresses = eth_sui_bridge_contract_addresses
+            .iter()
+            .map(|address| EthAddress::from_str(address).unwrap())
+            .collect();
         Ok(Self {
-            bridge_address,
+            bridge_addresses,
             eth_http_url,
             indexer_metrics,
             bridge_metrics,
@@ -164,7 +172,7 @@ impl Datasource<RawEthData> for EthFinalizedSyncDatasource {
         let client: Arc<EthClient<MeteredEthHttpProvier>> = Arc::new(
             EthClient::<MeteredEthHttpProvier>::new(
                 &self.eth_http_url,
-                HashSet::from_iter(vec![self.bridge_address]),
+                HashSet::from_iter(self.bridge_addresses.clone()),
                 self.bridge_metrics.clone(),
             )
             .await?,
@@ -175,87 +183,151 @@ impl Datasource<RawEthData> for EthFinalizedSyncDatasource {
                 .interval(std::time::Duration::from_millis(2000)),
         );
 
-        let bridge_address = self.bridge_address;
+        let bridge_addresses = self.bridge_addresses.clone();
         let indexer_metrics: BridgeIndexerMetrics = self.indexer_metrics.clone();
         let client = Arc::clone(&client);
         let provider = Arc::clone(&provider);
+        let bridge_metrics = Arc::clone(&self.bridge_metrics);
+        let current_block = provider.get_block_number().await?.as_u64();
 
         let handle = spawn_monitored_task!(async move {
-            let mut cached_blocks: HashMap<u64, Block<H256>> = HashMap::new();
-
-            let mut last_finalized_block = retry_with_max_elapsed_time!(
-                client.get_last_finalized_block_id(),
-                Duration::from_secs(30000)
-            )
-            .expect("Unable to get latest finalized block from provider")
-            .expect("Failed to unwrap the inner result");
-
-            // block process until current range is finalized
-            while target_checkpoint > last_finalized_block {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-
-                last_finalized_block = retry_with_max_elapsed_time!(
-                    client.get_last_finalized_block_id(),
-                    Duration::from_secs(30000)
-                )
-                .expect("Unable to retry fetching the finalized block")
-                .expect("Unable to get latest finalized block from provider");
-            }
-
-            let Ok(Ok(logs)) = retry_with_max_elapsed_time!(
-                client.get_raw_events_in_range(
-                    bridge_address,
+            if target_checkpoint > current_block {
+                retrieve_and_process_live_finalized_logs(
+                    client,
+                    provider,
+                    bridge_addresses,
                     starting_checkpoint,
-                    target_checkpoint
-                ),
-                Duration::from_secs(30000)
-            ) else {
-                panic!("Unable to get logs from provider");
-            };
-
-            let mut data = Vec::new();
-            let mut first_block = 0;
-
-            for log in logs {
-                let block = if let Some(cached_block) = cached_blocks.get(&log.block_number) {
-                    cached_block.clone()
-                } else {
-                    let Ok(Ok(Some(block))) = retry_with_max_elapsed_time!(
-                        provider.get_block(log.block_number),
-                        Duration::from_secs(30000)
-                    ) else {
-                        panic!("Unable to get block from provider");
-                    };
-
-                    cached_blocks.insert(log.block_number, block.clone());
-                    block
-                };
-
-                if first_block == 0 {
-                    first_block = log.block_number;
-                }
-
-                let Ok(Ok(Some(transaction))) = retry_with_max_elapsed_time!(
-                    provider.get_transaction(log.tx_hash),
-                    Duration::from_secs(30000)
-                ) else {
-                    panic!("Unable to get transaction from provider");
-                };
-
-                data.push((log, block, transaction));
+                    data_sender,
+                    indexer_metrics,
+                    bridge_metrics,
+                )
+                .await;
+            } else {
+                retrieve_and_process_log_range(
+                    client,
+                    provider,
+                    bridge_addresses,
+                    starting_checkpoint,
+                    target_checkpoint,
+                    data_sender,
+                    indexer_metrics,
+                )
+                .await?;
             }
-
-            data_sender.send((target_checkpoint, data)).await?;
-
-            indexer_metrics
-                .last_synced_eth_block
-                .set(first_block as i64);
-
             Ok::<_, Error>(())
         });
 
         Ok(handle)
     }
+}
+
+async fn retrieve_and_process_live_finalized_logs(
+    client: Arc<EthClient<MeteredEthHttpProvier>>,
+    provider: Arc<Provider<Http>>,
+    addresses: Vec<EthAddress>,
+    starting_checkpoint: u64,
+    data_sender: DataSender<RawEthData>,
+    indexer_metrics: BridgeIndexerMetrics,
+    bridge_metrics: Arc<BridgeMetrics>,
+) {
+    let eth_contracts_to_watch = HashMap::from_iter(
+        addresses
+            .iter()
+            .map(|address| (*address, starting_checkpoint)),
+    );
+
+    let (_, mut eth_events_rx, _) = EthSyncer::new(client.clone(), eth_contracts_to_watch)
+        .run(bridge_metrics.clone())
+        .await
+        .expect("Failed to start eth syncer");
+
+    // forward received events to the data sender
+    while let Some((_, block, logs)) = eth_events_rx.recv().await {
+        let raw_logs: Vec<RawEthLog> = logs
+            .into_iter()
+            .map(|log| RawEthLog {
+                block_number: block,  // Handle block number conversion
+                tx_hash: log.tx_hash, // Assuming `event` contains `tx_hash`
+                log: log.log,
+            })
+            .collect();
+
+        process_logs(raw_logs, provider.clone(), data_sender.clone(), block)
+            .await
+            .expect("Failed to process logs");
+        indexer_metrics.latest_committed_eth_block.set(block as i64);
+    }
+
+    panic!("Eth syncer stopped unexpectedly");
+}
+
+async fn retrieve_and_process_log_range(
+    client: Arc<EthClient<MeteredEthHttpProvier>>,
+    provider: Arc<Provider<Http>>,
+    addresses: Vec<EthAddress>,
+    starting_checkpoint: u64,
+    target_checkpoint: u64,
+    data_sender: DataSender<RawEthData>,
+    indexer_metrics: BridgeIndexerMetrics,
+) -> Result<(), Error> {
+    let Ok(Ok(logs)) = retry_with_max_elapsed_time!(
+        client.get_raw_events_in_range(addresses.clone(), starting_checkpoint, target_checkpoint),
+        Duration::from_secs(30000)
+    ) else {
+        panic!("Unable to get logs from provider");
+    };
+
+    process_logs(
+        logs,
+        provider.clone(),
+        data_sender.clone(),
+        target_checkpoint,
+    )
+    .await?;
+
+    indexer_metrics
+        .last_synced_eth_block
+        .set(target_checkpoint as i64);
+
+    Ok::<_, Error>(())
+}
+
+async fn process_logs(
+    logs: Vec<RawEthLog>,
+    provider: Arc<Provider<Http>>,
+    data_sender: DataSender<RawEthData>,
+    target_checkpoint: u64,
+) -> Result<(), Error> {
+    let mut data = Vec::new();
+    let mut cached_blocks: HashMap<u64, Block<H256>> = HashMap::new();
+    for log in logs {
+        let block = if let Some(cached_block) = cached_blocks.get(&log.block_number) {
+            cached_block.clone()
+        } else {
+            let Ok(Ok(Some(block))) = retry_with_max_elapsed_time!(
+                provider.get_block(log.block_number),
+                Duration::from_secs(30000)
+            ) else {
+                panic!("Unable to get block from provider");
+            };
+
+            cached_blocks.insert(log.block_number, block.clone());
+            block
+        };
+
+        let Ok(Ok(Some(transaction))) = retry_with_max_elapsed_time!(
+            provider.get_transaction(log.tx_hash),
+            Duration::from_secs(30000)
+        ) else {
+            panic!("Unable to get transaction from provider");
+        };
+
+        data.push((log, block, transaction));
+    }
+
+    data_sender.send((target_checkpoint, data)).await?;
+
+    Ok::<_, Error>(())
 }
 
 #[derive(Clone)]
